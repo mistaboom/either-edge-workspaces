@@ -1,36 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import Shell from 'gi://Shell';
 import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {WorkspaceGroup} from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 
-// These are properties of Shell's live window actors. Workspace membership
-// alone can include a window before it has an actor, or while it is closing.
-const NO_WINDOWS = 0;
-const OTHER_WORKSPACE = 1;
-const LEFT_WORKSPACE = 2;
-
-function windowLocation(left, leftHasMembers) {
+// Prefer a window on the left edge. Workspace membership alone can include
+// a window before it has a compositor actor, or while it is closing.
+function findWindow(left, leftHasMembers) {
     if (!leftHasMembers) {
         const focus = global.display.focus_window;
         if (focus && !focus.is_on_all_workspaces() &&
             focus.get_compositor_private()?.is_destroyed() === false)
-            return OTHER_WORKSPACE;
+            return focus;
     }
 
-    let location = NO_WINDOWS;
+    let otherWindow = null;
     for (const actor of global.get_window_actors()) {
         const window = actor.get_meta_window();
         if (window.is_on_all_workspaces())
             continue;
-        if (!leftHasMembers)
-            return OTHER_WORKSPACE;
-        if (window.get_workspace() === left)
-            return LEFT_WORKSPACE;
-        location = OTHER_WORKSPACE;
+        if (!leftHasMembers || window.get_workspace() === left)
+            return window;
+        otherWindow = window;
     }
-    return location;
+    return otherWindow;
 }
 
 // The 48.7 tracker treats a recently removed splash window as occupied.
@@ -38,15 +33,27 @@ function windowLocation(left, leftHasMembers) {
 // during the check replaces the marker and must survive cleanup.
 const protectedWorkspace = {get_window_type: () => Meta.WindowType.SPLASHSCREEN};
 
-function protect(workspace) {
-    const previous = workspace._lastRemovedWindow;
-    workspace._lastRemovedWindow = protectedWorkspace;
-    return previous;
+function overviewSwipeActive() {
+    if (!Main.overview.visible)
+        return false;
+    const display = Main.overview._overview?.controls._workspacesDisplay;
+    return display?._gestureActive && display.mapped;
 }
 
-function restore(workspace, previous) {
-    if (workspace._lastRemovedWindow === protectedWorkspace)
-        workspace._lastRemovedWindow = previous;
+function hasWorkspaceReservation(workspaces) {
+    for (const workspace of workspaces) {
+        if (workspace._keepAliveId)
+            return true;
+        const type = workspace._lastRemovedWindow?.get_window_type();
+        if (type === Meta.WindowType.SPLASHSCREEN || type === Meta.WindowType.DIALOG ||
+            type === Meta.WindowType.MODAL_DIALOG)
+            return true;
+    }
+
+    return Shell.WindowTracker.get_default().get_startup_sequences().some(sequence => {
+        const index = sequence.get_workspace();
+        return index >= 0 && index <= workspaces.length;
+    });
 }
 
 // A 48.x animation owns a snapshot of clones. A restack can include actors
@@ -67,10 +74,6 @@ function restackClones() {
 export default class EitherEdgeWorkspaces extends Extension {
     enable() {
         const tracker = Main.wm._workspaceTracker;
-        // Remember the actual workspace, not its index: prepending the left
-        // landing space keeps this desktop and its overview card selected.
-        if (this._loginWorkspace === undefined)
-            this._loginWorkspace = global.workspace_manager.get_active_workspace();
         this._hooks = new InjectionManager();
         this._hooks.overrideMethod(Object.getPrototypeOf(tracker), '_checkWorkspaces',
             original => () => this._check(tracker, original));
@@ -82,11 +85,12 @@ export default class EitherEdgeWorkspaces extends Extension {
     }
 
     _check(tracker, original) {
-        const dynamic = Meta.prefs_get_dynamic_workspaces();
-        if (!dynamic)
-            this._loginWorkspace = null;
-        if (!dynamic || tracker._pauseWorkspaceCheck)
+        if (!Meta.prefs_get_dynamic_workspaces() || tracker._pauseWorkspaceCheck)
             return original.call(tracker);
+
+        // Activities resolves its swipe destination by index, even on release.
+        if (overviewSwipeActive())
+            return GLib.SOURCE_CONTINUE;
 
         // The switcher snapshots its workspace list for the duration of a swipe.
         const group = Main.wm._workspaceAnimation?._switchData?.monitors[0];
@@ -104,39 +108,43 @@ export default class EitherEdgeWorkspaces extends Extension {
 
         let left = tracker._workspaces[0];
         const leftHasMembers = left.n_windows !== 0;
-        // Once login protection ends, Shell already keeps an active blank left
-        // edge. Its right-hand blank is determined by the occupied workspaces.
-        if (!leftHasMembers && !this._loginWorkspace && left.active)
-            return original.call(tracker);
+        const window = findWindow(left, leftHasMembers);
+        if (!window) {
+            if (hasWorkspaceReservation(tracker._workspaces))
+                return original.call(tracker);
 
-        const location = windowLocation(left, leftHasMembers);
-        if (this._loginWorkspace && (location !== NO_WINDOWS ||
-            !tracker._workspaces.includes(this._loginWorkspace)))
-            this._loginWorkspace = null;
+            // Shell 48 enforces a minimum of two. Reuse the pending redraw
+            // check after each removal so synchronous workspace-change listeners
+            // can activate, populate or reserve a remaining workspace.
+            if (tracker._workspaces.length > 1) {
+                const last = tracker._workspaces.at(-1);
+                const unused = last.active ? tracker._workspaces.at(-2) : last;
+                global.workspace_manager.remove_workspace(unused, global.get_current_time());
+                return GLib.SOURCE_CONTINUE;
+            }
+            tracker._checkWorkspacesId = 0;
+            return GLib.SOURCE_REMOVE;
+        }
 
-        if (location === NO_WINDOWS && !this._loginWorkspace)
-            return original.call(tracker);
-
-        if (location === LEFT_WORKSPACE || left === this._loginWorkspace) {
+        if (leftHasMembers && window.get_workspace() === left) {
             const manager = global.workspace_manager;
             left = manager.append_new_workspace(false, global.get_current_time());
             manager.reorder_workspace(left, 0);
+            // A reorder listener can stick or close the window that caused
+            // the prepend. Recheck before treating the new edge as occupied.
+            if (window.is_on_all_workspaces() || !window.get_compositor_private())
+                return GLib.SOURCE_CONTINUE;
+        } else if (left.active) {
+            return original.call(tracker);
         }
 
-        const login = this._loginWorkspace;
-        const previousLeft = protect(left);
+        const previous = left._lastRemovedWindow;
+        left._lastRemovedWindow = protectedWorkspace;
         try {
-            if (!login)
-                return original.call(tracker);
-
-            const previousLogin = protect(login);
-            try {
-                return original.call(tracker);
-            } finally {
-                restore(login, previousLogin);
-            }
+            return original.call(tracker);
         } finally {
-            restore(left, previousLeft);
+            if (left._lastRemovedWindow === protectedWorkspace)
+                left._lastRemovedWindow = previous;
         }
     }
 
@@ -152,7 +160,6 @@ export default class EitherEdgeWorkspaces extends Extension {
     }
 
     disable() {
-        this._loginWorkspace = null;
         if (this._switchGroup) {
             this._switchGroup.disconnect(this._switchDone);
             this._switchGroup = null;
@@ -160,7 +167,7 @@ export default class EitherEdgeWorkspaces extends Extension {
         global.workspace_manager.disconnect(this._reordered);
         this._hooks.clear();
         const animation = Main.wm._workspaceAnimation;
-        if (animation?._switchData) {
+        if (animation?._switchData || overviewSwipeActive()) {
             // Shell binds the callback in _queueCheckWorkspaces(). Let that one
             // native later wait just as it would for a paused check. This keeps
             // swipe targets alive through release, including the easing phase.
@@ -168,7 +175,7 @@ export default class EitherEdgeWorkspaces extends Extension {
             // can replace it by its normal later ID.
             const proto = Object.getPrototypeOf(Main.wm._workspaceTracker);
             this._hooks.overrideMethod(proto, '_checkWorkspaces', check => function () {
-                if (animation._switchData)
+                if (animation?._switchData || overviewSwipeActive())
                     return GLib.SOURCE_CONTINUE;
                 return check.call(this);
             });

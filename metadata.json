@@ -1,10 +1,10 @@
 {
   "uuid": "either-edge-workspaces@local",
   "name": "Either Edge Workspaces",
-  "description": "Add a blank workspace to the left of occupied workspaces, alongside GNOME’s normal blank workspace on the right.",
+  "description": "Start with one empty workspace. Keep an empty workspace on either side while windows are open.",
   "shell-version": [
     "48"
   ],
-  "version": 5,
+  "version": 6,
   "url": "https://github.com/mistaboom/either-edge-workspaces"
 }

@@ -2,9 +2,9 @@
 
 A GNOME Shell 48 extension that keeps an empty workspace to the left of your windows. GNOME supplies the empty workspace on the right. Tested on GNOME Shell 48.7 with Wayland.
 
-On a fresh login with dynamic workspaces, Activities opens on the middle of three empty workspaces. Swipe either way to get started. An outward swipe stops at an empty edge. Open a window there and a new empty workspace appears beyond it.
+On a fresh login with dynamic workspaces, Activities opens on one empty workspace. A swipe in either direction stays there. Open the first window and an empty workspace appears on each side. An outward swipe stops at an empty edge. Open a window there and a new empty workspace appears beyond it.
 
-If you close the last window between two occupied workspaces, the empty workspace stays selected until you leave. Once all windows are closed, GNOME returns to its usual two workspaces. Fixed-workspace mode uses GNOME’s normal layout.
+If you close the last window between two occupied workspaces, the empty workspace stays selected until you leave. Once all windows are closed, only the selected workspace remains. Fixed-workspace mode uses GNOME’s normal layout.
 
 ## Install
 
