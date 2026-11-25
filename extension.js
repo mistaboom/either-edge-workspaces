@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
+import {TransientSignalHolder} from 'resource:///org/gnome/shell/misc/signalTracker.js';
+import {PopupAnimation} from 'resource:///org/gnome/shell/ui/boxpointer.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-import {WorkspaceGroup} from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
+import {MonitorGroup, WorkspaceGroup} from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
+import {WorkspacesDisplay} from 'resource:///org/gnome/shell/ui/workspacesView.js';
+
+import {WorkspaceLaunches} from './launches.js';
 
 // Prefer a window on the left edge. Workspace membership alone can include
 // a window before it has a compositor actor, or while it is closing.
@@ -33,11 +39,136 @@ function findWindow(left, leftHasMembers) {
 // during the check replaces the marker and must survive cleanup.
 const protectedWorkspace = {get_window_type: () => Meta.WindowType.SPLASHSCREEN};
 
+function onPanelMenuGesture(menu, actor, event) {
+    if (event.type() !== Clutter.EventType.TOUCHPAD_SWIPE ||
+        event.get_gesture_phase() !== Clutter.TouchpadGesturePhase.BEGIN ||
+        event.get_touchpad_gesture_finger_count() !== 3 ||
+        global.stage.get_grab_actor() !== actor || !menu.isOpen ||
+        (actor !== menu.actor && actor !== menu._activeMenu?.actor))
+        return Clutter.EVENT_PROPAGATE;
+
+    // BEGIN's capture path already starts at the popup grab. Release it and
+    // give GNOME the same BEGIN it would receive with the menus closed.
+    menu.close(PopupAnimation.FULL);
+    const grab = global.stage.get_grab_actor();
+    if (!grab || grab === global.stage)
+        global.stage.event(event, true);
+    return Clutter.EVENT_STOP;
+}
+
+function watchPanelMenus(holder) {
+    const {dateMenu, quickSettings} = Main.panel.statusArea;
+    const quickMenu = quickSettings?.menu;
+    const watch = (menu, actor) => actor.connectObject(
+        'captured-event::touchpad', onPanelMenuGesture.bind(null, menu), holder);
+
+    for (const menu of [dateMenu?.menu, quickMenu]) {
+        if (menu)
+            watch(menu, menu.actor);
+    }
+
+    // Expanded tiles grab their own actors. Shell adds those actors to the
+    // overlay, including tiles added after the extension is enabled.
+    const overlay = quickMenu?._overlay;
+    if (overlay) {
+        for (const actor of overlay.get_children())
+            watch(quickMenu, actor);
+        overlay.connectObject(
+            'child-added', (_overlay, actor) => watch(quickMenu, actor),
+            'child-removed', (_overlay, actor) => actor.disconnectObject(holder), holder);
+    }
+}
+
 function overviewSwipeActive() {
     if (!Main.overview.visible)
         return false;
     const display = Main.overview._overview?.controls._workspacesDisplay;
     return display?._gestureActive && display.mapped;
+}
+
+function workspaceIsEmpty(workspace) {
+    return workspace.list_windows().every(window => window.is_on_all_workspaces());
+}
+
+function restoreLoginOverview(launches, holder) {
+    const {layoutManager, overview} = Main;
+    if (!layoutManager._startingUp || Meta.is_restart())
+        return;
+
+    // A monitor relayout hides the native window picker, even during login.
+    const startup = new TransientSignalHolder(holder);
+    let layoutChanged = false;
+    layoutManager.connectObject(
+        'monitors-changed', () => { layoutChanged = true; },
+        'startup-complete', () => {
+            startup.destroy();
+            if (layoutChanged && !overview.visibleTarget && Main.actionMode === Shell.ActionMode.NORMAL &&
+                Meta.prefs_get_dynamic_workspaces() && !launches.pending.size &&
+                workspaceIsEmpty(global.workspace_manager.get_active_workspace()))
+                overview.show();
+        }, startup);
+}
+
+// 48.7 resolves a workspace object at gesture begin and again at release.
+// Observe the native choice before even a zero-duration snap can activate it.
+function watchWorkspaceSwitches(hooks, resumeCheck, holder) {
+    const animation = Main.wm._workspaceAnimation;
+    const controller = Object.getPrototypeOf(animation);
+    let landing = null;
+    const syncMonitorGroups = () => {
+        const data = animation._switchData;
+        if (!data)
+            return;
+
+        const {monitors} = data;
+        const primary = Main.layoutManager.primaryIndex;
+        if (monitors.at(-1)?.index === primary)
+            return;
+
+        // The primary's completion destroys every group. Ease that group last.
+        const index = monitors.findIndex(group => group.index === primary);
+        if (index >= 0) {
+            monitors.push(monitors.splice(index, 1)[0]);
+        } else if (monitors.length === 1 && data.baseMonitorGroup &&
+            Meta.prefs_get_workspaces_only_on_primary() && !data.baseMonitorGroup.get_transition('progress')) {
+            // A held swipe on the former primary cannot finish this snapshot.
+            // An already-released swipe still has its native completion callback.
+            landing = null;
+            animation._finishWorkspaceSwitch(data);
+        }
+    };
+    syncMonitorGroups();
+    Main.layoutManager.connectObject('monitors-changed', syncMonitorGroups, holder);
+    hooks.overrideMethod(controller, '_prepareWorkspaceSwitch', original =>
+        function (indices) {
+            original.call(this, indices);
+            if (this._switchData?.monitors.length > 1)
+                syncMonitorGroups();
+        });
+    hooks.overrideMethod(MonitorGroup.prototype, 'findClosestWorkspace', original =>
+        function (progress) {
+            const target = original.call(this, progress);
+            const event = Clutter.get_current_event();
+            landing = null;
+            if (!target.active && this === animation._switchData?.baseMonitorGroup &&
+                event?.type() === Clutter.EventType.TOUCHPAD_SWIPE &&
+                event.get_gesture_phase() === Clutter.TouchpadGesturePhase.END &&
+                event.get_touchpad_gesture_finger_count() === 3)
+                landing = target;
+            return target;
+        });
+    hooks.overrideMethod(controller, '_finishWorkspaceSwitch', original =>
+        function (switchData) {
+            const target = landing;
+            landing = null;
+            original.call(this, switchData);
+            resumeCheck();
+            // Check at landing: a slow app may have opened during the snap.
+            if (target?.active && Main.actionMode === Shell.ActionMode.NORMAL &&
+                !Main.overview.visible && Meta.prefs_get_dynamic_workspaces() &&
+                workspaceIsEmpty(target))
+                Main.overview.show();
+        });
 }
 
 function hasWorkspaceReservation(workspaces) {
@@ -59,6 +190,9 @@ function hasWorkspaceReservation(workspaces) {
 // A 48.x animation owns a snapshot of clones. A restack can include actors
 // that mapped later, and desktop clones belong to the background instead.
 function restackClones() {
+    if (this._windowRecords.length === 0)
+        return;
+
     let sibling = this._background ?? null;
     for (const actor of global.get_window_actors()) {
         const record = this._windowRecords.find(r => r.windowActor === actor);
@@ -75,41 +209,63 @@ export default class EitherEdgeWorkspaces extends Extension {
     enable() {
         const tracker = Main.wm._workspaceTracker;
         this._hooks = new InjectionManager();
+        this._launches = new WorkspaceLaunches(this._hooks, () => tracker._queueCheckWorkspaces());
         this._hooks.overrideMethod(Object.getPrototypeOf(tracker), '_checkWorkspaces',
             original => () => this._check(tracker, original));
         this._hooks.overrideMethod(WorkspaceGroup.prototype, '_syncStacking',
             () => restackClones);
         this._reordered = global.workspace_manager.connect('workspaces-reordered',
             () => tracker._queueCheckWorkspaces());
+        this._signals = new TransientSignalHolder();
+        watchPanelMenus(this._signals);
+        restoreLoginOverview(this._launches, this._signals);
+
+        const resumeCheck = () => {
+            if (this._deferredCheck) {
+                this._deferredCheck = false;
+                tracker._queueCheckWorkspaces();
+            }
+        };
+        watchWorkspaceSwitches(this._hooks, resumeCheck, this._signals);
+        this._hooks.overrideMethod(WorkspacesDisplay.prototype, '_endTouchGesture', original =>
+            function () {
+                original.call(this);
+                resumeCheck();
+            });
+        Main.overview._overview?.controls._workspacesDisplay.connectObject(
+            'notify::mapped', resumeCheck, this._signals);
         this._queueFreshCheck();
     }
 
     _check(tracker, original) {
-        if (!Meta.prefs_get_dynamic_workspaces() || tracker._pauseWorkspaceCheck)
+        if (!Meta.prefs_get_dynamic_workspaces()) {
+            this._launches.clear();
+            return original.call(tracker);
+        }
+        if (tracker._pauseWorkspaceCheck)
             return original.call(tracker);
 
-        // Activities resolves its swipe destination by index, even on release.
-        if (overviewSwipeActive())
-            return GLib.SOURCE_CONTINUE;
-
-        // The switcher snapshots its workspace list for the duration of a swipe.
-        const group = Main.wm._workspaceAnimation?._switchData?.monitors[0];
-        if (group) {
-            if (!this._switchGroup) {
-                this._switchGroup = group;
-                this._switchDone = group.connect('destroy', () => {
-                    this._switchGroup = null;
-                    tracker._queueCheckWorkspaces();
-                });
-            }
+        // Both switchers own a snapshot through release and easing. Their
+        // completion callbacks (or an unmap in Activities) resume a pending check.
+        if (overviewSwipeActive() || Main.wm._workspaceAnimation?._switchData?.monitors[0]) {
+            this._deferredCheck = true;
             tracker._checkWorkspacesId = 0;
             return GLib.SOURCE_REMOVE;
         }
 
         let left = tracker._workspaces[0];
         const leftHasMembers = left.n_windows !== 0;
-        const window = findWindow(left, leftHasMembers);
-        if (!window) {
+        const pending = this._launches.pending;
+        let reserved = null;
+        if (pending.size) {
+            reserved = new Map();
+            for (const {workspace} of pending)
+                reserved.set(workspace, null);
+        }
+        const leftReserved = reserved?.has(left);
+        const window = leftReserved || (reserved && !leftHasMembers)
+            ? null : findWindow(left, leftHasMembers);
+        if (!window && !reserved) {
             if (hasWorkspaceReservation(tracker._workspaces))
                 return original.call(tracker);
 
@@ -126,16 +282,35 @@ export default class EitherEdgeWorkspaces extends Extension {
             return GLib.SOURCE_REMOVE;
         }
 
-        if (leftHasMembers && window.get_workspace() === left) {
+        if (leftReserved || (leftHasMembers && window?.get_workspace() === left)) {
             const manager = global.workspace_manager;
             left = manager.append_new_workspace(false, global.get_current_time());
             manager.reorder_workspace(left, 0);
             // A reorder listener can stick or close the window that caused
             // the prepend. Recheck before treating the new edge as occupied.
-            if (window.is_on_all_workspaces() || !window.get_compositor_private())
+            if (window && (window.is_on_all_workspaces() || !window.get_compositor_private()))
                 return GLib.SOURCE_CONTINUE;
-        } else if (left.active) {
+        } else if (!reserved && left.active) {
             return original.call(tracker);
+        }
+
+        if (reserved) {
+            // Shell already scans real windows and protects the active workspace.
+            // Let it see launches as occupied in that same synchronous check.
+            reserved.set(left, null);
+            for (const workspace of reserved.keys()) {
+                // A reorder listener may have changed the marker.
+                reserved.set(workspace, workspace._lastRemovedWindow);
+                workspace._lastRemovedWindow = protectedWorkspace;
+            }
+            try {
+                return original.call(tracker);
+            } finally {
+                for (const [workspace, previous] of reserved) {
+                    if (workspace._lastRemovedWindow === protectedWorkspace)
+                        workspace._lastRemovedWindow = previous;
+                }
+            }
         }
 
         const previous = left._lastRemovedWindow;
@@ -148,7 +323,7 @@ export default class EitherEdgeWorkspaces extends Extension {
         }
     }
 
-    _queueFreshCheck() {
+    _queueFreshCheck(disabling = false) {
         const tracker = Main.wm._workspaceTracker;
         const laters = global.compositor.get_laters();
         // Shell binds the method when it queues a check. Replace any stale callback.
@@ -156,35 +331,30 @@ export default class EitherEdgeWorkspaces extends Extension {
             laters.remove(tracker._checkWorkspacesId);
             tracker._checkWorkspacesId = 0;
         }
+        if (disabling) {
+            const animation = Main.wm._workspaceAnimation;
+            const switching = () => animation?._switchData || overviewSwipeActive();
+            if (switching()) {
+                // Keep Shell's one pending later through release and easing.
+                // Re-enabling can replace it using the same tracker-owned ID.
+                const check = tracker._checkWorkspaces.bind(tracker);
+                tracker._checkWorkspacesId = laters.add(Meta.LaterType.BEFORE_REDRAW,
+                    () => switching() ? GLib.SOURCE_CONTINUE : check());
+                return;
+            }
+        }
         tracker._queueCheckWorkspaces();
     }
 
     disable() {
-        if (this._switchGroup) {
-            this._switchGroup.disconnect(this._switchDone);
-            this._switchGroup = null;
-        }
+        this._signals.destroy();
+        this._signals = null;
+        this._deferredCheck = false;
+        this._launches.destroy();
+        this._launches = null;
         global.workspace_manager.disconnect(this._reordered);
         this._hooks.clear();
-        const animation = Main.wm._workspaceAnimation;
-        if (animation?._switchData || overviewSwipeActive()) {
-            // Shell binds the callback in _queueCheckWorkspaces(). Let that one
-            // native later wait just as it would for a paused check. This keeps
-            // swipe targets alive through release, including the easing phase.
-            // The bound callback retains only Shell objects, and a re-enable
-            // can replace it by its normal later ID.
-            const proto = Object.getPrototypeOf(Main.wm._workspaceTracker);
-            this._hooks.overrideMethod(proto, '_checkWorkspaces', check => function () {
-                if (animation?._switchData || overviewSwipeActive())
-                    return GLib.SOURCE_CONTINUE;
-                return check.call(this);
-            });
-        }
-        try {
-            this._queueFreshCheck();
-        } finally {
-            this._hooks.clear();
-            this._hooks = null;
-        }
+        this._hooks = null;
+        this._queueFreshCheck(true);
     }
 }

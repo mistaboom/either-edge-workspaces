@@ -1,10 +1,20 @@
-# Either Edge Workspaces
+# Workspace Flow
+
+Launch apps where you choose. Swipe to an empty workspace to open Activities.
 
 A GNOME Shell 48 extension that keeps an empty workspace to the left of your windows. GNOME supplies the empty workspace on the right. Tested on GNOME Shell 48.7 with Wayland.
 
-On a fresh login with dynamic workspaces, Activities opens on one empty workspace. A swipe in either direction stays there. Open the first window and an empty workspace appears on each side. An outward swipe stops at an empty edge. Open a window there and a new empty workspace appears beyond it.
+On a fresh login with dynamic workspaces, GNOME opens the Activities Overview on one empty workspace. The desktop preview shrinks and the Dash shows your favorite apps, just like one three-finger swipe up. If GNOME rearranges the displays during login, the extension restores that view on the primary display when the empty session is ready. A swipe in either direction stays there. Launch an app from Activities and an empty workspace appears on each side while the app starts. You can swipe away and launch another app. Each new window opens on the workspace where you launched it when GNOME can identify its launch. An outward swipe stops at an empty edge. Launch an app there and a new empty workspace appears beyond it.
 
-If you close the last window between two occupied workspaces, the empty workspace stays selected until you leave. Once all windows are closed, only the selected workspace remains. Fixed-workspace mode uses GNOME’s normal layout.
+If you close the last window between two occupied workspaces, the empty workspace stays selected until you leave. Once all windows are closed and no launches are pending, only the selected workspace remains. Fixed-workspace mode uses GNOME’s normal layout.
+
+GNOME Shell launchers share the same placement logic across apps. For example, drag an app icon onto a workspace thumbnail in Activities to launch it there. The extension remembers each launch workspace for up to 60 seconds, even if its number changes. When it matches a new window to its launch, it also prevents a late Wayland activation token from switching you back after you leave. If two requests for the same running app target different workspaces and their windows have no token or process ID that distinguishes them, GNOME handles their placement.
+
+On the desktop with dynamic workspaces, a completed three-finger touchpad swipe to a different empty workspace opens Activities, just like one swipe up. GNOME finishes the workspace switch first. If a window lands there during the swipe animation, you stay on the desktop. With workspaces on all displays, both animated and instantaneous switches finish on the native destination. If workspaces are on the primary display only and you change which display is primary during a swipe, you stay on the workspace where you started. If you have already lifted your fingers, GNOME finishes the switch.
+
+With Quick Settings (including an expanded tile) or the calendar open, start a three-finger touchpad swipe to close the menu. The same swipe continues through GNOME, so you can switch workspaces in one motion.
+
+During a workspace swipe, existing window previews follow changes in stacking order. New windows appear when the switch finishes. Workspace cleanup waits until the desktop or Activities swipe finishes so that the workspace list stays stable during the gesture.
 
 ## Install
 
@@ -25,7 +35,7 @@ gnome-extensions enable either-edge-workspaces@local
 From the repository root, run the following command. It writes the same installable zip format to the current directory.
 
 ```sh
-gnome-extensions pack --extra-source=COPYING .
+gnome-extensions pack --extra-source=COPYING --extra-source=launches.js .
 ```
 
 ## Check a swipe
