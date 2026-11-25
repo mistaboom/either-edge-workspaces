@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch the saved GNOME display layout
+
+[Path]
+PathChanged=@SOURCE_HOME@/.config/monitors.xml
+
+[Install]
+WantedBy=multi-user.target

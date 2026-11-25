@@ -1,10 +1,14 @@
 {
   "uuid": "either-edge-workspaces@local",
   "name": "Workspace Flow",
-  "description": "Launch apps where you choose. Swipe to an empty workspace to open Activities.\n\nWith dynamic workspaces, keep one free at each end while apps are opening or in use. Swipe away while an app starts and its window can still open where you launched it. A single three-finger swipe can dismiss Quick Settings or the calendar and switch workspaces. Window previews follow stacking changes during swipes, and Activities can reopen after a display change at login.",
+  "description": "Launch apps where you choose. Swipe to an empty workspace to open Activities.\n\nWith dynamic workspaces, keep one free at each end while apps are opening or in use. Swipe away while an app starts and its window can still open where you launched it. A single three-finger swipe can dismiss Quick Settings or the calendar and switch workspaces. Window previews follow stacking changes during swipes, and Activities can reopen after a display change at login. With optional system-wide setup, the login screen opens the password prompt when it lists a single account.",
   "shell-version": [
     "48"
   ],
-  "version": 12,
+  "session-modes": [
+    "user",
+    "gdm"
+  ],
+  "version": 14,
   "url": "https://github.com/mistaboom/either-edge-workspaces"
 }

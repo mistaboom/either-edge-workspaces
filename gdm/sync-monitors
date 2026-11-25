@@ -1,0 +1,108 @@
+#!/usr/bin/python3 -I
+"""Copy one user's saved Mutter display layouts into the Debian GDM greeter."""
+
+import os
+import pwd
+import stat
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+MAX_BYTES = 4 * 1024 * 1024
+
+
+def read_source(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError("monitor layout must be a regular file")
+        data = source.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise ValueError("monitor layout exceeds 4 MiB")
+    return data
+
+
+def validate_layout(data):
+    text = data.decode("utf-8")
+    if "<!DOCTYPE" in text or "\0" in text:
+        raise ValueError("expected a UTF-8 GNOME display configuration without a DTD")
+    root = ET.fromstring(text)
+    if root.tag != "monitors" or root.get("version") != "2":
+        raise ValueError("expected a version 2 monitors.xml")
+    configs = root.findall("configuration")
+    if not configs or len(configs) != len(root):
+        raise ValueError("expected GNOME display configurations")
+    for config in configs:
+        displays = config.findall("logicalmonitor")
+        if not displays:
+            raise ValueError("configuration has no active display")
+        for display in displays:
+            monitors = display.findall("monitor")
+            if not monitors:
+                raise ValueError("logical monitor has no physical display")
+            for monitor in monitors:
+                if not all(monitor.findtext("monitorspec/" + field)
+                           for field in ("connector", "vendor", "product", "serial")):
+                    raise ValueError("monitor is missing its hardware identity")
+                width = int(monitor.findtext("mode/width", "0"))
+                height = int(monitor.findtext("mode/height", "0"))
+                rate = float(monitor.findtext("mode/rate", "0"))
+                if min(width, height) <= 0 or not 0 < rate < float("inf"):
+                    raise ValueError("monitor has an invalid display mode")
+
+
+def save_layout(data, target):
+    validate_layout(data)
+    try:
+        if not target.is_symlink() and read_source(target) == data:
+            return
+    except (FileNotFoundError, ValueError):
+        pass
+
+    # The temporary file and destination share a filesystem. Keep the last
+    # working file in place until the new contents have been written in full.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".monitors-", delete=False) as out:
+            temporary = Path(out.name)
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def main():
+    if sys.argv[1:] == ["--read"]:
+        layout = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".config" / "monitors.xml"
+        sys.stdout.buffer.write(read_source(layout))
+        return
+    if len(sys.argv) != 2 or not sys.argv[1].isascii() or not sys.argv[1].isdecimal():
+        raise ValueError("usage: sync-monitors SOURCE_UID")
+    source = pwd.getpwuid(int(sys.argv[1]))
+    greeter = pwd.getpwnam("Debian-gdm")
+    if os.geteuid() != 0 or source.pw_uid in (0, greeter.pw_uid):
+        raise ValueError("run the service as root for a separate desktop user")
+
+    # Each file is opened solely with its owner's permissions. Python's
+    # isolated mode also prevents imports from either account's environment.
+    data = subprocess.check_output(
+        [sys.executable, "-I", __file__, "--read"],
+        user=source.pw_uid, group=source.pw_gid, extra_groups=[], timeout=10,
+    )
+    os.setgroups([])
+    os.setgid(greeter.pw_gid)
+    os.setuid(greeter.pw_uid)
+    save_layout(data, Path(greeter.pw_dir) / ".config" / "monitors.xml")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, ET.ParseError, subprocess.SubprocessError) as error:
+        sys.exit(f"sync-monitors: {error}")

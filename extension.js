@@ -10,6 +10,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {MonitorGroup, WorkspaceGroup} from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 import {WorkspacesDisplay} from 'resource:///org/gnome/shell/ui/workspacesView.js';
 
+import {watchLoginChooser} from './greeter.js';
 import {WorkspaceLaunches} from './launches.js';
 
 // Prefer a window on the left edge. Workspace membership alone can include
@@ -207,6 +208,11 @@ function restackClones() {
 
 export default class EitherEdgeWorkspaces extends Extension {
     enable() {
+        if (Main.sessionMode.isGreeter) {
+            this._stopWatchingLogin = watchLoginChooser();
+            return;
+        }
+
         const tracker = Main.wm._workspaceTracker;
         this._hooks = new InjectionManager();
         this._launches = new WorkspaceLaunches(this._hooks, () => tracker._queueCheckWorkspaces());
@@ -347,6 +353,12 @@ export default class EitherEdgeWorkspaces extends Extension {
     }
 
     disable() {
+        if (this._stopWatchingLogin) {
+            this._stopWatchingLogin();
+            this._stopWatchingLogin = null;
+            return;
+        }
+
         this._signals.destroy();
         this._signals = null;
         this._deferredCheck = false;

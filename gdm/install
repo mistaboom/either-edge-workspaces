@@ -1,0 +1,99 @@
+#!/usr/bin/python3 -I
+"""Install Workspace Flow for Debian 13's login screen from this checkout."""
+
+import os
+import pwd
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+UUID = "either-edge-workspaces@local"
+HELPER = Path("/usr/local/libexec/workspace-flow/sync-monitors")
+UNITS = Path("/etc/systemd/system")
+
+
+def install_bytes(target, data, mode=0o644):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as out:
+        stage = Path(out.name)
+        try:
+            out.write(data)
+            out.flush()
+            os.fchmod(out.fileno(), mode)
+            os.replace(stage, target)
+        finally:
+            stage.unlink(missing_ok=True)
+
+
+def run_as_greeter(greeter, program, *args):
+    env = {"HOME": greeter.pw_dir, "USER": greeter.pw_name,
+           "PATH": "/usr/bin:/bin", "DCONF_PROFILE": "gdm"}
+    subprocess.run(
+        ["/usr/bin/dbus-run-session", "--", "/usr/bin/python3", "-I", "-", *args],
+        input=program, text=True, check=True, user=greeter.pw_uid,
+        group=greeter.pw_gid, extra_groups=[], cwd="/", env=env,
+    )
+
+
+def main():
+    if os.geteuid() != 0 or os.environ.get("SUDO_UID", "0") == "0":
+        sys.exit("Run sudo ./gdm/install from the account whose display settings GDM should use.")
+    owner = pwd.getpwuid(int(os.environ["SUDO_UID"]))
+    greeter = pwd.getpwnam("Debian-gdm")
+    if owner.pw_uid == greeter.pw_uid:
+        sys.exit("Run the installer from your desktop account.")
+    os.umask(0o022)
+
+    # Read the whole payload before changing the system installation.
+    dest = Path("/usr/share/gnome-shell/extensions") / UUID
+    payload = {name: (HERE.parent / name).read_bytes() for name in (
+        "COPYING", "greeter.js", "launches.js", "extension.js", "metadata.json")}
+    helper = (HERE / "sync-monitors").read_bytes()
+    configure = (HERE / "configure-greeter.py").read_text()
+    unit_files = {}
+    for suffix in ("service.in", "path.in", "timer"):
+        template = "workspace-flow-monitors." + suffix
+        name = template.removesuffix(".in")
+        content = (HERE / template).read_text()
+        for key, value in (("SOURCE_HOME", owner.pw_dir), ("SOURCE_UID", str(owner.pw_uid)),
+                           ("GDM_HOME", greeter.pw_dir)):
+            content = content.replace(f"@{key}@", value.replace("%", "%%"))
+        unit_files[name] = content.encode()
+
+    # GDM has a separate dconf database. Make a copy of its previous layout
+    # under its own account, and merge only the settings needed by this setup.
+    first_setup = not (UNITS / "workspace-flow-monitors.path").exists()
+    for name, data in payload.items():
+        install_bytes(dest / name, data)
+    run_as_greeter(greeter, configure, *(["--backup-layout"] if first_setup else []))
+    install_bytes(HELPER, helper, 0o755)
+    for name, data in unit_files.items():
+        install_bytes(UNITS / name, data)
+
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    triggers = [name for name in unit_files if name.endswith((".path", ".timer"))]
+    subprocess.run(["systemctl", "enable", "--now", *triggers], check=True)
+    subprocess.run(["systemctl", "start", "workspace-flow-monitors.service"], check=True)
+
+    for name, data in payload.items():
+        if (dest / name).read_bytes() != data:
+            sys.exit(f"System installation differs from the checkout: {name}")
+    for unit in triggers:
+        subprocess.run(["systemctl", "is-active", "--quiet", unit], check=True)
+    run_as_greeter(greeter, configure, "--verify")
+    if (Path(owner.pw_dir) / ".config/monitors.xml").is_file():
+        def checksum(account):
+            path = str(Path(account.pw_dir) / ".config/monitors.xml")
+            return subprocess.check_output(
+                ["/usr/bin/sha256sum", "--", path], user=account.pw_uid,
+                group=account.pw_gid, extra_groups=[], cwd="/").split()[0]
+        if checksum(owner) != checksum(greeter):
+            sys.exit("The two layouts differ. Check systemctl status workspace-flow-monitors.service.")
+        print("Verified that the user and greeter monitor layouts match.")
+    print("Workspace Flow is enabled for the next GDM greeter. Display sync is active.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+[Unit]
+Description=Copy the saved GNOME display layout to the Debian GDM greeter
+ConditionPathExists=@SOURCE_HOME@/.config/monitors.xml
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/workspace-flow/sync-monitors @SOURCE_UID@
+TimeoutStartSec=20
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+ProtectSystem=strict
+ReadWritePaths=@GDM_HOME@/.config
+PrivateTmp=yes
+PrivateDevices=yes
