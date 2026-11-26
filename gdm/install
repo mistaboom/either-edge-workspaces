@@ -1,8 +1,11 @@
 #!/usr/bin/python3 -I
-"""Install Workspace Flow for Debian 13's login screen from this checkout."""
+"""Install Streamlined Workspaces for Debian 13's login screen from this checkout."""
 
+import fcntl
 import os
 import pwd
+import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -10,11 +13,22 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 UUID = "either-edge-workspaces@local"
-HELPER = Path("/usr/local/libexec/workspace-flow/sync-monitors")
+EXTENSION = Path("/usr/share/gnome-shell/extensions") / UUID
+PREFIX = "streamlined-workspaces-monitors."
+HELPER = Path("/usr/local/libexec/streamlined-workspaces/sync-monitors")
 UNITS = Path("/etc/systemd/system")
+
+# Upgrade the monitor integration installed under the v14 name.
+OLD_PREFIX = "workspace-flow-monitors."
+OLD_HELPER = Path("/usr/local/libexec/workspace-flow/sync-monitors")
 
 
 def install_bytes(target, data, mode=0o644):
+    if not target.is_symlink() and target.is_file():
+        info = target.stat()
+        if (info.st_uid == os.geteuid() and info.st_gid == os.getegid()
+                and stat.S_IMODE(info.st_mode) == mode and target.read_bytes() == data):
+            return
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as out:
         stage = Path(out.name)
@@ -37,6 +51,149 @@ def run_as_greeter(greeter, program, *args):
     )
 
 
+def systemctl(*args):
+    subprocess.run(["systemctl", *args], check=True)
+
+
+def trigger_state(name):
+    return tuple(subprocess.run(["systemctl", op, "--quiet", name]).returncode == 0
+                 for op in ("is-enabled", "is-active"))
+
+
+def stock_unit(data, template, greeter):
+    # The active integration may currently follow a different desktop user.
+    template = template.replace(b"@GDM_HOME@", os.fsencode(greeter.pw_dir.replace("%", "%%")))
+    pattern = re.escape(template).replace(b"@SOURCE_UID@", rb"[0-9]+").replace(b"@SOURCE_HOME@", rb"/[^\n]*")
+    return re.fullmatch(pattern, data) is not None
+
+
+def sync_layout(owner, greeter):
+    systemctl("start", PREFIX + "service")
+    if (Path(owner.pw_dir) / ".config/monitors.xml").is_file():
+        def checksum(account):
+            path = str(Path(account.pw_dir) / ".config/monitors.xml")
+            return subprocess.check_output(
+                ["/usr/bin/sha256sum", "--", path], user=account.pw_uid,
+                group=account.pw_gid, extra_groups=[], cwd="/").split()[0]
+        if checksum(owner) != checksum(greeter):
+            sys.exit("The two layouts differ. Check systemctl status streamlined-workspaces-monitors.service.")
+        print("Verified that the user and greeter monitor layouts match.")
+
+
+def update(owner, greeter):
+    payload = {name: (HERE.parent / name).read_bytes() for name in (
+        "COPYING", "greeter.js", "launches.js", "extension.js", "metadata.json")}
+    helper = (HERE / "sync-monitors").read_bytes()
+    configure = (HERE / "configure-greeter.py").read_text()
+    targets = {}
+    legacy = {}
+    retargeting = False
+    for suffix in ("service.in", "path.in", "timer"):
+        kind = suffix.removesuffix(".in")
+        template = (HERE / (PREFIX + suffix)).read_text()
+        content = template
+        for key, value in (("SOURCE_HOME", owner.pw_dir), ("SOURCE_UID", str(owner.pw_uid)),
+                           ("GDM_HOME", greeter.pw_dir)):
+            content = content.replace(f"@{key}@", value.replace("%", "%%"))
+        path = UNITS / (PREFIX + kind)
+        old = UNITS / (OLD_PREFIX + kind)
+        # Never remove an unrelated file or an administrator's override.
+        for fragment in (old, path):
+            if not os.path.lexists(fragment):
+                continue
+            if fragment.is_symlink() or not fragment.is_file():
+                sys.exit(f"Review the customized monitor integration at {fragment} before migrating.")
+            current = fragment.read_bytes()
+            defaults = template
+            if fragment == old:
+                defaults = defaults.replace("Description=Streamlined Workspaces — ", "Description=", 1)
+                defaults = defaults.replace(str(HELPER), str(OLD_HELPER))
+                dropins = subprocess.check_output(
+                    ["systemctl", "show", "--property=DropInPaths", "--value", old.name], text=True)
+                if dropins.strip():
+                    sys.exit(f"Review the custom systemd configuration for {old.name}: {dropins.strip()}")
+                if kind == "service":
+                    retargeting = str(OLD_HELPER).encode() + f" {owner.pw_uid}\n".encode() not in current
+                legacy[old] = current
+            if not stock_unit(current, defaults.encode(), greeter):
+                sys.exit(f"Review the customized monitor integration at {fragment} before updating it.")
+        targets[path] = content.encode()
+
+    for path in (HELPER, OLD_HELPER):
+        if not os.path.lexists(path) or (path == OLD_HELPER and not legacy):
+            continue
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != helper:
+            sys.exit(f"Review the customized monitor helper at {path} before updating it.")
+        if path == OLD_HELPER:
+            legacy = {path: helper, **legacy}  # Remove the old helper before its identifying units.
+
+    # Preserve the administrator's active/enabled choices. If a previous
+    # migration stopped midway, either installed name may own the live trigger.
+    pending = UNITS / ("." + PREFIX + "installing")
+    marker = b"Streamlined Workspaces initial installation\n"
+    retry = os.path.lexists(pending)
+    if retry and (pending.is_symlink() or not pending.is_file() or pending.read_bytes() != marker):
+        sys.exit(f"Review the existing file at {pending} before installing.")
+    first_setup = retry or (not legacy and not any(path.exists() for path in targets))
+    states = {}
+    for kind in ("path", "timer"):
+        names = [prefix + kind for prefix in (OLD_PREFIX, PREFIX)
+                 if os.path.lexists(UNITS / (prefix + kind))]
+        current = [trigger_state(name) for name in names]
+        if current and not first_setup:
+            states[kind] = (any(enabled for enabled, _ in current), any(active for _, active in current))
+        else:
+            states[kind] = (True, True)
+
+    if first_setup:
+        install_bytes(pending, marker)
+    for name, data in payload.items():
+        install_bytes(EXTENSION / name, data)
+    run_as_greeter(greeter, configure, *(["--backup-layout"] if first_setup else []))
+    install_bytes(HELPER, helper, 0o755)
+    for path, data in targets.items():
+        install_bytes(path, data)
+
+    systemctl("daemon-reload")
+    for kind, (enabled, active) in states.items():
+        name = PREFIX + kind
+        if enabled:
+            systemctl("enable", name)
+        if active:
+            systemctl("restart" if kind == "path" else "start", name)
+        if trigger_state(name) != (enabled, active):
+            sys.exit(f"Could not verify the monitor trigger state for {name}")
+    sync_layout(owner, greeter)
+    run_as_greeter(greeter, configure, "--verify")
+    targets[HELPER] = helper
+    targets.update({EXTENSION / name: data for name, data in payload.items()})
+    for target, data in targets.items():
+        if target.read_bytes() != data:
+            sys.exit(f"System installation differs from the checkout: {target}")
+
+    if legacy:
+        for kind in ("path", "timer"):
+            old = UNITS / (OLD_PREFIX + kind)
+            if old in legacy:
+                systemctl("disable", "--now", old.name)
+        if UNITS / (OLD_PREFIX + "service") in legacy:
+            systemctl("stop", OLD_PREFIX + "service")
+        if retargeting:
+            # An old trigger may have published the previous owner's layout
+            # after the replacement service was first verified.
+            sync_layout(owner, greeter)
+        for old, expected in legacy.items():
+            if not old.is_symlink() and old.is_file() and old.read_bytes() == expected:
+                old.unlink()
+        if OLD_HELPER in legacy and not any(OLD_HELPER.parent.iterdir()):
+            OLD_HELPER.parent.rmdir()
+        systemctl("daemon-reload")
+
+    if first_setup:
+        pending.unlink()
+    print("Streamlined Workspaces is installed for the next GDM greeter.")
+
+
 def main():
     if os.geteuid() != 0 or os.environ.get("SUDO_UID", "0") == "0":
         sys.exit("Run sudo ./gdm/install from the account whose display settings GDM should use.")
@@ -45,54 +202,13 @@ def main():
     if owner.pw_uid == greeter.pw_uid:
         sys.exit("Run the installer from your desktop account.")
     os.umask(0o022)
-
-    # Read the whole payload before changing the system installation.
-    dest = Path("/usr/share/gnome-shell/extensions") / UUID
-    payload = {name: (HERE.parent / name).read_bytes() for name in (
-        "COPYING", "greeter.js", "launches.js", "extension.js", "metadata.json")}
-    helper = (HERE / "sync-monitors").read_bytes()
-    configure = (HERE / "configure-greeter.py").read_text()
-    unit_files = {}
-    for suffix in ("service.in", "path.in", "timer"):
-        template = "workspace-flow-monitors." + suffix
-        name = template.removesuffix(".in")
-        content = (HERE / template).read_text()
-        for key, value in (("SOURCE_HOME", owner.pw_dir), ("SOURCE_UID", str(owner.pw_uid)),
-                           ("GDM_HOME", greeter.pw_dir)):
-            content = content.replace(f"@{key}@", value.replace("%", "%%"))
-        unit_files[name] = content.encode()
-
-    # GDM has a separate dconf database. Make a copy of its previous layout
-    # under its own account, and merge only the settings needed by this setup.
-    first_setup = not (UNITS / "workspace-flow-monitors.path").exists()
-    for name, data in payload.items():
-        install_bytes(dest / name, data)
-    run_as_greeter(greeter, configure, *(["--backup-layout"] if first_setup else []))
-    install_bytes(HELPER, helper, 0o755)
-    for name, data in unit_files.items():
-        install_bytes(UNITS / name, data)
-
-    subprocess.run(["systemctl", "daemon-reload"], check=True)
-    triggers = [name for name in unit_files if name.endswith((".path", ".timer"))]
-    subprocess.run(["systemctl", "enable", "--now", *triggers], check=True)
-    subprocess.run(["systemctl", "start", "workspace-flow-monitors.service"], check=True)
-
-    for name, data in payload.items():
-        if (dest / name).read_bytes() != data:
-            sys.exit(f"System installation differs from the checkout: {name}")
-    for unit in triggers:
-        subprocess.run(["systemctl", "is-active", "--quiet", unit], check=True)
-    run_as_greeter(greeter, configure, "--verify")
-    if (Path(owner.pw_dir) / ".config/monitors.xml").is_file():
-        def checksum(account):
-            path = str(Path(account.pw_dir) / ".config/monitors.xml")
-            return subprocess.check_output(
-                ["/usr/bin/sha256sum", "--", path], user=account.pw_uid,
-                group=account.pw_gid, extra_groups=[], cwd="/").split()[0]
-        if checksum(owner) != checksum(greeter):
-            sys.exit("The two layouts differ. Check systemctl status workspace-flow-monitors.service.")
-        print("Verified that the user and greeter monitor layouts match.")
-    print("Workspace Flow is enabled for the next GDM greeter. Display sync is active.")
+    # Coordinate concurrent invocations without leaving a lock file behind.
+    descriptor = os.open(UNITS, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        update(owner, greeter)
+    finally:
+        os.close(descriptor)
 
 
 if __name__ == "__main__":

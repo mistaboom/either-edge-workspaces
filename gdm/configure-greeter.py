@@ -37,8 +37,10 @@ def configure():
     directory = Path.home() / ".config"
     directory.mkdir(exist_ok=True, mode=0o700)
     layout = directory / "monitors.xml"
-    backup = directory / "monitors.xml.before-workspace-flow"
-    if "--backup-layout" in sys.argv and layout.is_file() and not backup.exists():
+    backup = directory / "monitors.xml.before-streamlined-workspaces"
+    historical_backup = directory / "monitors.xml.before-workspace-flow"
+    if ("--backup-layout" in sys.argv and layout.is_file()
+            and not os.path.lexists(backup) and not os.path.lexists(historical_backup)):
         with layout.open("rb") as src, backup.open("xb") as dst:
             os.fchmod(dst.fileno(), 0o600)
             shutil.copyfileobj(src, dst)
@@ -50,7 +52,7 @@ def configure():
         raise RuntimeError("Could not disable the routine power confirmation for GDM.")
     disabled = shell.get_strv("disabled-extensions")
     if uuid in disabled and not shell.set_strv("disabled-extensions", [x for x in disabled if x != uuid]):
-        raise RuntimeError("Could not enable Workspace Flow in GDM's dconf profile.")
+        raise RuntimeError("Could not enable Streamlined Workspaces in GDM's dconf profile.")
     add_setting(shell, "enabled-extensions", uuid)
     Gio.Settings.sync()
 

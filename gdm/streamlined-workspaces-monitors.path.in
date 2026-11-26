@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch the saved GNOME display layout
+Description=Streamlined Workspaces — Watch the saved GNOME display layout
 
 [Path]
 PathChanged=@SOURCE_HOME@/.config/monitors.xml

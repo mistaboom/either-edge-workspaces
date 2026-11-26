@@ -74,7 +74,7 @@ export function watchLoginChooser() {
                 select = !request.is_cancelled() && !timedLogin && soleLoginItem(dialog) === item;
             } catch (error) {
                 if (!request.is_cancelled())
-                    console.warn(`Workspace Flow could not check GDM timed login: ${error.message}`);
+                    console.warn(`Streamlined Workspaces could not check GDM timed login: ${error.message}`);
             } finally {
                 if (!request.is_cancelled())
                     lifetime.destroy();

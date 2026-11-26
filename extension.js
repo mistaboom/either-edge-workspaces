@@ -322,7 +322,7 @@ function restackClones() {
     }
 }
 
-export default class EitherEdgeWorkspaces extends Extension {
+export default class StreamlinedWorkspaces extends Extension {
     enable() {
         if (Main.sessionMode.isGreeter) {
             this._stopWatchingLogin = watchLoginChooser();

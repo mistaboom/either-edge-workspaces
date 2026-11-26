@@ -1,4 +1,4 @@
-# Workspace Flow
+# Streamlined Workspaces
 
 Launch apps where you choose. Swipe to an empty workspace to open Activities.
 
@@ -20,7 +20,7 @@ During a workspace swipe, existing window previews follow changes in stacking or
 
 ## Install
 
-Download `either-edge-workspaces@local.shell-extension.zip` from the [latest release](https://github.com/mistaboom/either-edge-workspaces/releases/latest). Run the following command from the directory containing the download.
+Download `either-edge-workspaces@local.shell-extension.zip` from the [latest release](https://github.com/mistaboom/streamlined-workspaces/releases/latest). Run the following command from the directory containing the download.
 
 ```sh
 gnome-extensions install --force ./either-edge-workspaces@local.shell-extension.zip
@@ -34,7 +34,7 @@ gnome-extensions enable either-edge-workspaces@local
 
 ## Use your saved displays and account at login on Debian 13
 
-From this source checkout, run the command below once in a terminal from the desktop account whose layouts GDM should follow. It installs Workspace Flow for the login screen and enables synchronization of that account’s saved GNOME display layouts.
+From this source checkout, run the command below in a terminal from the desktop account whose layouts GDM should follow. It installs or updates Streamlined Workspaces for the login screen and enables synchronization of that account’s saved GNOME display layouts.
 
 ```sh
 sudo ./gdm/install
@@ -42,7 +42,7 @@ sudo ./gdm/install
 
 Use **Settings → Displays**, choose your primary screen or turn off a screen, then select **Apply → Keep Changes**. Each saved layout is copied to GDM, including its primary display, disabled screens and scale. The next login screen uses the layout for the connected hardware. Configure each new monitor setup once in Displays. The installer enables fractional scaling for the greeter and saves a first-install backup of an existing greeter layout.
 
-At a fresh login screen with one eligible account, Workspace Flow selects the account and lets GDM ask for the password or other configured authentication. Press Escape to return to the chooser. If multiple accounts are listed, choose one as usual. Timed login and authentication methods that determine the account themselves continue through GDM.
+At a fresh login screen with one eligible account, Streamlined Workspaces selects the account and lets GDM ask for the password or other configured authentication. Press Escape to return to the chooser. If multiple accounts are listed, choose one as usual. Timed login and authentication methods that determine the account themselves continue through GDM.
 
 The installer also turns off GDM’s routine confirmation countdown for **Restart** and **Power Off**. GNOME can still show a prompt when something is blocking the action.
 

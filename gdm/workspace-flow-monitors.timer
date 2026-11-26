@@ -1,9 +1,0 @@
-[Unit]
-Description=Recheck the GDM display layout after boot and overlapping saves
-
-[Timer]
-OnBootSec=1min
-OnUnitInactiveSec=30min
-
-[Install]
-WantedBy=timers.target
