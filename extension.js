@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -89,6 +90,121 @@ function overviewSwipeActive() {
 
 function workspaceIsEmpty(workspace) {
     return workspace.list_windows().every(window => window.is_on_all_workspaces());
+}
+
+function followIndicatorSwipe(indicators, occupied, holder) {
+    let spacing = 0;
+
+    const update = () => {
+        const rtl = indicators.get_text_direction() === Clutter.TextDirection.RTL;
+        let preceding = 0;
+        let remainder = 0;
+        let index = 0;
+        for (const dot of indicators.get_children()) {
+            if (dot.destroying) {
+                dot.hide();
+                continue;
+            }
+
+            // Shell's expansion follows the workspace under the fingers, even
+            // before release. An unoccupied marker takes up zero space at rest.
+            const weight = occupied[index++] ? 1 : dot.expansion;
+            dot.visible = weight > 0;
+            if (!dot.visible)
+                continue;
+
+            // A box normally inserts a whole gap as soon as a child is shown.
+            // Grow only the part of the gap shared with a preceding marker.
+            const gap = Math.round(spacing * Math.max(0, preceding + weight - 1));
+            preceding = Math.min(1, preceding + weight);
+            dot.margin_left = rtl ? 0 : gap;
+            dot.margin_right = rtl ? gap : 0;
+            dot.opacity = Math.round(255 * Math.sqrt(weight));
+            if (weight < 1) {
+                const [, baseWidth] = dot._dot.get_preferred_width(-1);
+                const fullWidth = Math.round(baseWidth * dot.widthMultiplier);
+                // PanelMenu switches padding when a fractional size is rounded
+                // down by its parent. Share whole pixels between emerging and
+                // departing empty dots so their combined width stays steady.
+                const exact = fullWidth * weight + remainder;
+                const width = Math.clamp(Math.round(exact), 1, Math.max(1, fullWidth - 1));
+                remainder = exact - width;
+                dot.set_width(width);
+            } else if (dot.natural_width_set) {
+                dot.set_width(-1);
+            }
+        }
+    };
+
+    const restyle = () => {
+        if (!indicators.get_stage())
+            return;
+        spacing = Math.round(indicators.get_theme_node().get_length('spacing'));
+        indicators.layout_manager.spacing = 0;
+        update();
+    };
+    indicators.connectObject('style-changed', restyle, GObject.ConnectFlags.AFTER,
+        'destroy', () => {
+            holder.disconnectObject(indicators);
+            holder.destroy();
+        }, holder);
+    indicators._workspacesAdjustment.connectObject('notify::value', update, holder);
+    holder.connectObject('destroy', () => {
+        indicators.layout_manager.spacing = spacing;
+        for (const dot of indicators.get_children()) {
+            dot.set_width(-1);
+            dot.set({margin_left: 0, margin_right: 0, opacity: 255, visible: true});
+        }
+    }, indicators);
+    restyle();
+    return update;
+}
+
+function watchWorkspaceIndicators(launches, holder) {
+    const manager = global.workspace_manager;
+    const occupied = [];
+    let indicators = null;
+    let signals = null;
+    let update = null;
+    const sync = () => {
+        const panel = Main.panel.statusArea.activities?.get_children()
+            .find(child => typeof child._getActiveIndicators === 'function');
+        occupied.length = manager.n_workspaces;
+        for (let i = 0; i < occupied.length; i++)
+            occupied[i] = !workspaceIsEmpty(manager.get_workspace_by_index(i));
+        for (const {workspace} of launches.pending) {
+            const index = workspace.index();
+            if (index >= 0 && index < occupied.length)
+                occupied[index] = true;
+        }
+
+        if (panel !== indicators) {
+            signals?.destroy();
+            indicators = panel;
+            if (panel) {
+                signals = new TransientSignalHolder(holder);
+                update = followIndicatorSwipe(panel, occupied, signals);
+                panel._workspacesAdjustment.connectObject('notify::upper', sync, signals);
+            } else {
+                signals = null;
+                update = null;
+            }
+        }
+        if (!indicators)
+            return;
+
+        // A newly appended dot can briefly follow a retiring one. Shell uses
+        // raw child indices for its native expansion and opacity.
+        indicators._getActiveIndicators().forEach((dot, i) => {
+            if (indicators.get_child_at_index(i) !== dot)
+                indicators.set_child_at_index(dot, i);
+        });
+        indicators._updateExpansion();
+        update();
+    };
+    Main.sessionMode.connectObject('updated', sync, holder);
+    sync();
+    return sync;
 }
 
 function restoreLoginOverview(launches, holder) {
@@ -216,13 +332,20 @@ export default class EitherEdgeWorkspaces extends Extension {
         const tracker = Main.wm._workspaceTracker;
         this._hooks = new InjectionManager();
         this._launches = new WorkspaceLaunches(this._hooks, () => tracker._queueCheckWorkspaces());
+        // Shell already coalesces window membership, monitor and launch changes
+        // into this check, including while the workspace layout is fixed.
+        this._signals = new TransientSignalHolder();
+        const syncIndicators = watchWorkspaceIndicators(this._launches, this._signals);
         this._hooks.overrideMethod(Object.getPrototypeOf(tracker), '_checkWorkspaces',
-            original => () => this._check(tracker, original));
+            original => () => {
+                const result = this._check(tracker, original);
+                syncIndicators();
+                return result;
+            });
         this._hooks.overrideMethod(WorkspaceGroup.prototype, '_syncStacking',
             () => restackClones);
         this._reordered = global.workspace_manager.connect('workspaces-reordered',
             () => tracker._queueCheckWorkspaces());
-        this._signals = new TransientSignalHolder();
         watchPanelMenus(this._signals);
         restoreLoginOverview(this._launches, this._signals);
 
