@@ -2,7 +2,9 @@
 
 Launch apps where you choose. Swipe to an empty workspace to open Activities.
 
-A GNOME Shell 48 extension that keeps an empty workspace to the left of your windows. GNOME supplies the empty workspace on the right. Tested on GNOME Shell 48.7 with Wayland.
+Streamlined Workspaces keeps an empty workspace to the left of your windows. GNOME supplies the empty workspace on the right. Tested on Debian 13 with GNOME Shell 48.7 on Wayland.
+
+I maintain this extension on GitHub for the GNOME Shell version I use on Debian. When I upgrade my desktop, development moves with it. Older versions remain available in the Git history and GitHub Releases.
 
 On a fresh login with dynamic workspaces, GNOME opens the Activities Overview on one empty workspace. The desktop preview shrinks and the Dash shows your favorite apps, just like one three-finger swipe up. If GNOME rearranges the displays during login, the extension restores that view on the primary display when the empty session is ready. A swipe in either direction stays there. Launch an app from Activities and an empty workspace appears on each side while the app starts. You can swipe away and launch another app. Each new window opens on the workspace where you launched it when GNOME can identify its launch. An outward swipe stops at an empty edge. Launch an app there and a new empty workspace appears beyond it.
 
@@ -12,11 +14,11 @@ The top-left indicator shows GNOME’s stretched pill for the workspace you’re
 
 GNOME Shell launchers share the same placement logic across apps. For example, drag an app icon onto a workspace thumbnail in Activities to launch it there. The extension remembers each launch workspace for up to 60 seconds, even if its number changes. When it matches a new window to its launch, it also prevents a late Wayland activation token from switching you back after you leave. If two requests for the same running app target different workspaces and their windows have no token or process ID that distinguishes them, GNOME handles their placement.
 
-On the desktop with dynamic workspaces, a completed three-finger touchpad swipe to a different empty workspace opens Activities, just like one swipe up. GNOME finishes the workspace switch first. If a window lands there during the swipe animation, you stay on the desktop. With workspaces on all displays, both animated and instantaneous switches finish on the native destination. If workspaces are on the primary display only and you change which display is primary during a swipe, you stay on the workspace where you started. If you have already lifted your fingers, GNOME finishes the switch.
+On the desktop with dynamic workspaces, swipe horizontally with three fingers toward an empty workspace to preview Activities. Hold your fingers still to pause the preview, or slide back to unwind it. Finish the swipe on the empty workspace and Activities opens there, just like one swipe up. If you return to your starting workspace, finish on an occupied workspace, or a window lands on the destination before the switch finishes, you stay on the desktop. With workspaces on all displays, both animated and instantaneous switches finish on the native destination. If workspaces are on the primary display only and you change which display is primary during a swipe, you stay on the workspace where you started. If you have already lifted your fingers, GNOME finishes the switch.
 
 With Quick Settings (including an expanded tile) or the calendar open, start a three-finger touchpad swipe to close the menu. The same swipe continues through GNOME, so you can switch workspaces in one motion.
 
-During a workspace swipe, existing window previews follow changes in stacking order. New windows appear when the switch finishes. Workspace cleanup waits until the desktop or Activities swipe finishes so that the workspace list stays stable during the gesture.
+When you swipe between occupied workspaces, existing window previews follow changes in stacking order. New windows appear when the switch finishes. Workspace cleanup waits until the desktop or Activities swipe finishes so that the workspace list stays stable during the gesture.
 
 ## Install
 
@@ -56,7 +58,9 @@ gnome-extensions pack --force --extra-source=COPYING --extra-source=launches.js 
 
 ## Check a swipe
 
-With dynamic workspaces enabled, open two overlapping windows on the same workspace. Start and hold a desktop swipe. While it is held, have another window open on that workspace and raise one of the original windows. The original window previews should restack in the same order as their windows. A newly opened window appears when the swipe finishes.
+With dynamic workspaces enabled, start on a workspace with a window. Swipe partway toward an empty neighbor and pause with three fingers on the touchpad. The Activities preview should hold its position. Slide back and release on your starting workspace to return to the desktop. Repeat the swipe and finish on the empty workspace to enter Activities.
+
+To check window stacking, open two overlapping windows on one workspace and a window on its neighbor. Start swiping toward the occupied neighbor and hold. While it is held, have another window open on that workspace and raise one of the original windows. The original window previews should restack in the same order as their windows. A newly opened window appears when the swipe finishes.
 
 Repeat with the extension disabled during the swipe. Finish the gesture, check the workspace you landed on, then re-enable the extension. To inspect Shell errors from this test, run the following command.
 
@@ -65,6 +69,10 @@ journalctl --user -b _COMM=gnome-shell --since '5 minutes ago'
 ```
 
 Shell 48.7 builds the swipe from a snapshot of window clones. The extension follows GNOME’s approach of restacking only clones that belong to the snapshot, including separate handling for desktop backgrounds in the 48 implementation. [Upstream GNOME Shell fix](https://github.com/GNOME/gnome-shell/commit/e7e6de300cfb87c0f91738861b545017e5290ef9)
+
+## Credits
+
+Mistaboom designed and tested the workspace behavior. OpenAI Codex wrote substantial portions of the JavaScript and helped test the extension on GNOME Shell 48.7.
 
 ## License
 

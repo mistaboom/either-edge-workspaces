@@ -226,12 +226,149 @@ function restoreLoginOverview(launches, holder) {
         }, startup);
 }
 
-// 48.7 resolves a workspace object at gesture begin and again at release.
-// Observe the native choice before even a zero-duration snap can activate it.
+// Let the desktop swipe drive Shell's window picker without taking its input
+// grab. Emitting overview::showing before landing would cancel that swipe.
+function previewActivities(hooks, holder) {
+    const {overview, layoutManager} = Main;
+    const controls = overview._overview.controls;
+    const display = controls._workspacesDisplay;
+    let opacities = null;
+    let thumbnailBoxes = [];
+
+    function cancel() {
+        if (!opacities)
+            return;
+
+        for (const [group, opacity] of opacities)
+            group.opacity = opacity;
+        opacities = null;
+        for (const box of thumbnailBoxes)
+            box._destroyThumbnails();
+        thumbnailBoxes = [];
+        controls.gestureProgress(0);
+        controls._stateAdjustment.gestureInProgress = false;
+        display._gestureActive = false;
+        display.hide();
+        // A normal Super-key or vertical-gesture entry can take over the view.
+        if (!overview.visible) {
+            overview._coverPane.hide();
+            layoutManager.hideOverview();
+        }
+    }
+
+    // Super can request a state shift directly while the picker is moving.
+    for (const method of ['prepareToEnterOverview', '_shiftState']) {
+        hooks.overrideMethod(Object.getPrototypeOf(controls), method, original =>
+            function (...args) {
+                cancel();
+                return original.apply(this, args);
+            });
+    }
+    holder.connect('destroy', cancel);
+
+    function update(monitors, progress) {
+        if (progress <= 0) {
+            cancel();
+            return;
+        }
+        if (!opacities) {
+            controls.prepareToEnterOverview();
+            // Native workspace views otherwise activate the nearest workspace
+            // when the shared scroll adjustment crosses the halfway point.
+            display._gestureActive = true;
+            for (const view of display._workspacesViews)
+                view.startTouchGesture();
+            controls._stateAdjustment.gestureInProgress = true;
+            // Shell normally builds these on "showing". Allocate the same strip
+            // now so its height doesn't change the workspace size at handoff.
+            thumbnailBoxes = [controls._thumbnailsBox, ...display._workspacesViews.map(v => v._thumbnails)]
+                .filter(box => box && box._thumbnails.length === 0);
+            for (const box of thumbnailBoxes)
+                box._createThumbnails();
+
+            opacities = new Map(monitors.map(group => [group, group.opacity]));
+            for (const group of monitors)
+                group.opacity = 0;
+            layoutManager.overviewGroup.set_child_above_sibling(overview._coverPane, null);
+            overview._coverPane.show();
+            layoutManager.showOverview();
+        }
+        controls.gestureProgress(progress);
+    }
+
+    function finish() {
+        if (!opacities) {
+            overview.show();
+            return;
+        }
+        opacities = null;
+        thumbnailBoxes = [];
+        // The desktop has activated the destination and released its clones.
+        // Complete the same picker at its current scale, including its modal grab.
+        display._endTouchGesture();
+        overview._gestureUpdate(null, 1);
+        overview._gestureEnd(null, 0, 1);
+    }
+
+    return {update, cancel, finish};
+}
+
 function watchWorkspaceSwitches(hooks, resumeCheck, holder) {
     const animation = Main.wm._workspaceAnimation;
     const controller = Object.getPrototypeOf(animation);
+    const preview = previewActivities(hooks, holder);
+    let swipeSignals = null;
     let landing = null;
+
+    function stopTracking() {
+        swipeSignals?.destroy();
+        swipeSignals = null;
+    }
+
+    animation._swipeTracker.connectObject('begin', () => {
+        stopTracking();
+        landing = null;
+        const data = animation._switchData;
+        const base = data?.baseMonitorGroup;
+        const event = Clutter.get_current_event();
+        if (!base || base._workspaceGroups.length < 2 || event?.type() !== Clutter.EventType.TOUCHPAD_SWIPE ||
+            event.get_touchpad_gesture_finger_count() !== 3 ||
+            !Meta.prefs_get_dynamic_workspaces() || Main.overview.visible ||
+            Main.actionMode !== Shell.ActionMode.NORMAL) {
+            preview.cancel();
+            return;
+        }
+
+        // The picker pans with the primary group's workspace adjustment. After
+        // release each monitor animates on its own clock, so use the same group
+        // for zoom even when the gesture started on another display.
+        const stripGroup = data.monitors.find(group => group._workspacesAdjustment) ?? base;
+        const origin = global.workspace_manager.get_active_workspace();
+        const points = stripGroup.getSnapPoints();
+        const workspaces = stripGroup._workspaceGroups.map(group => group.workspace);
+        const weight = ws => ws !== origin && workspaceIsEmpty(ws) ? 1 : 0;
+
+        const update = () => {
+            if (Main.overview.visible || Main.actionMode !== Shell.ActionMode.NORMAL ||
+                !Meta.prefs_get_dynamic_workspaces()) {
+                preview.cancel();
+                return;
+            }
+            // Interpolate between the two workspaces on screen. A second swipe
+            // can interrupt the snap and carry the strip past the first neighbor.
+            const progress = Math.clamp(stripGroup.progress, points[0], points.at(-1));
+            const right = Math.max(1, points.findIndex(point => point >= progress));
+            const left = right - 1;
+            const fraction = (progress - points[left]) / (points[right] - points[left]);
+            preview.update(data.monitors,
+                (1 - fraction) * weight(workspaces[left]) + fraction * weight(workspaces[right]));
+        };
+        swipeSignals = new TransientSignalHolder(holder);
+        stripGroup.connectObject('notify::progress', update, swipeSignals);
+        for (const workspace of workspaces)
+            workspace.connectObject('window-added', update, 'window-removed', update, swipeSignals);
+    }, holder);
+
     const syncMonitorGroups = () => {
         const data = animation._switchData;
         if (!data)
@@ -255,7 +392,25 @@ function watchWorkspaceSwitches(hooks, resumeCheck, holder) {
         }
     };
     syncMonitorGroups();
-    Main.layoutManager.connectObject('monitors-changed', syncMonitorGroups, holder);
+    Main.layoutManager.connectObject('monitors-changed', () => {
+        stopTracking();
+        preview.cancel();
+        syncMonitorGroups();
+    }, holder);
+    global.stage.connectObject('notify::is-grabbed', () => {
+        if (!swipeSignals || !global.stage.is_grabbed)
+            return;
+        stopTracking();
+        landing = null;
+        preview.cancel();
+        // A modal switcher can consume the physical END. Let the tracker
+        // cancel a held swipe now, including its native clones and input state.
+        const tracker = animation._swipeTracker;
+        if (tracker.enabled) {
+            tracker.enabled = false;
+            tracker.enabled = true;
+        }
+    }, holder);
     hooks.overrideMethod(controller, '_prepareWorkspaceSwitch', original =>
         function (indices) {
             original.call(this, indices);
@@ -278,13 +433,17 @@ function watchWorkspaceSwitches(hooks, resumeCheck, holder) {
         function (switchData) {
             const target = landing;
             landing = null;
-            original.call(this, switchData);
-            resumeCheck();
-            // Check at landing: a slow app may have opened during the snap.
-            if (target?.active && Main.actionMode === Shell.ActionMode.NORMAL &&
+            stopTracking();
+            // A window may have arrived while the desktop was snapping into place.
+            const open = target?.active && Main.actionMode === Shell.ActionMode.NORMAL &&
                 !Main.overview.visible && Meta.prefs_get_dynamic_workspaces() &&
-                workspaceIsEmpty(target))
-                Main.overview.show();
+                workspaceIsEmpty(target);
+            if (!open)
+                preview.cancel();
+            original.call(this, switchData);
+            if (open)
+                preview.finish();
+            resumeCheck();
         });
 }
 
