@@ -13,6 +13,45 @@ function startupId(data) {
     return data?.lookup_value('startup-notification-id', null)?.get_string()[0];
 }
 
+class LaunchRequest {
+    constructor(workspace, appId, context, token, onLaunched, onFinished) {
+        this.workspace = workspace;
+        this.appId = appId;
+        this.token = token;
+        this.pid = 0;
+        this._context = context;
+
+        // A launch context can serve several requests at the same time.
+        context?.connectObject(
+            'launched', (_context, info, data) => {
+                if (info.get_id() !== appId || startupId(data) !== token)
+                    return;
+                this.pid = data?.lookup_value('pid', null)?.get_int32() ?? 0;
+                context.disconnectObject(this);
+                this._context = null;
+                onLaunched();
+            },
+            'launch-failed', (_context, id) => {
+                if (id === token)
+                    onFinished(this);
+            }, this);
+        this._timeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, LAUNCH_TIMEOUT_SECONDS, () => {
+            this._timeoutId = 0;
+            onFinished(this);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    destroy() {
+        this._context?.disconnectObject(this);
+        this._context = null;
+        if (this._timeoutId) {
+            GLib.source_remove(this._timeoutId);
+            this._timeoutId = 0;
+        }
+    }
+}
+
 export class WorkspaceLaunches {
     constructor(hooks, queueCheck) {
         this._queueCheck = queueCheck;
@@ -125,29 +164,10 @@ export class WorkspaceLaunches {
         if (!workspace || workspace.index() < 0)
             return;
 
-        const request = {workspace, appId, context, token, pid: 0};
-        if (context) {
-            context.connectObject(
-                'launched', (_context, info, data) => {
-                    if (info.get_id() !== appId || startupId(data) !== token)
-                        return;
-                    request.pid = data?.lookup_value('pid', null)?.get_int32() ?? 0;
-                    // The launch is dispatched. This context may be reused.
-                    context.disconnectObject(request);
-                    request.context = null;
-                    for (const window of this._windows.keys())
-                        this._place(window);
-                },
-                'launch-failed', (_context, id) => {
-                    if (id === token)
-                        this._finish(request);
-                }, request);
-        }
-        request.timeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, LAUNCH_TIMEOUT_SECONDS, () => {
-            request.timeout = 0;
-            this._finish(request);
-            return GLib.SOURCE_REMOVE;
-        });
+        const request = new LaunchRequest(workspace, appId, context, token, () => {
+            for (const window of this._windows.keys())
+                this._place(window);
+        }, finished => this._finish(finished));
         if (!this.pending.size) {
             global.display.connectObject('window-created', (_display, window) => {
                 const type = window.get_window_type();
@@ -219,13 +239,13 @@ export class WorkspaceLaunches {
                             this._retireToken(id);
                     }
                 }
-            }, this._activations);
+            }, this);
             this._tracker.connectObject('startup-sequence-changed', (_tracker, seq) => {
                 // A completed sequence can still be redeemed until removal.
                 if (this._activations.has(seq.get_id()) &&
                     !this._tracker.get_startup_sequences().includes(seq))
                     this._dropActivation(seq.get_id());
-            }, this._activations);
+            }, this);
         }
         this._activations.set(token, workspace);
     }
@@ -240,8 +260,8 @@ export class WorkspaceLaunches {
     _dropActivation(token) {
         this._activations.delete(token);
         if (!this._activations.size) {
-            global.workspace_manager.disconnectObject(this._activations);
-            this._tracker.disconnectObject(this._activations);
+            global.workspace_manager.disconnectObject(this);
+            this._tracker.disconnectObject(this);
         }
     }
 
@@ -253,10 +273,7 @@ export class WorkspaceLaunches {
     _finish(request) {
         if (!this.pending.delete(request))
             return;
-        request.context?.disconnectObject(request);
-        request.context = null;
-        if (request.timeout)
-            GLib.source_remove(request.timeout);
+        request.destroy();
         if (!this.pending.size)
             global.display.disconnectObject(this);
         for (const [window, eligible] of this._windows) {
@@ -267,10 +284,20 @@ export class WorkspaceLaunches {
     }
 
     clear() {
-        for (const id of this._activations.keys())
-            this._dropActivation(id);
+        if (!this.pending.size && !this._activations.size)
+            return;
+
+        global.workspace_manager.disconnectObject(this);
+        this._tracker.disconnectObject(this);
+        this._activations.clear();
+
+        global.display.disconnectObject(this);
+        for (const window of this._windows.keys())
+            window.disconnectObject(this);
+        this._windows.clear();
         for (const request of this.pending)
-            this._finish(request);
+            request.destroy();
+        this.pending.clear();
     }
 
     destroy() {
